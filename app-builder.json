@@ -1,0 +1,37 @@
+{
+  "package_name": "zerowave",
+  "version": "1.0.0",
+  "app_name": "ZeroWave",
+  "bin_name": "zerowave",
+  "description": "2m/70cm All-Mode RTL-SDR Scanner, Digital Voice & Telemetry Suite for Cardputer Zero",
+  "store": {
+    "summary": "2m/70cm All-Mode RTL-SDR DMR/YSF/FM/Pager/APRS/433/Sonde scanner",
+    "description": "Native 2m/70cm all-mode RTL-SDR receiver and auto-scanner for M5Stack Cardputer Zero. Features wideband FFT spectrum sweeping with peak detection, optimized Cortex-A53 dsd-fme digital voice decoding (DMR 2-slot, YSF, D-STAR, M17, dPMR, NXDN, P25), offline RadioID callsign & BrandMeister talkgroup database downloader, analog NFM/AM/WFM scanner, POCSAG/FLEX pager, APRS, rtl_433 sensors, RS41 weather balloons, per-mode logs, and zero-drop PipeWire WAV recording & playback.",
+    "locales": {
+      "de": { "summary": "2m/70cm All-Mode RTL-SDR Scanner für DMR, YSF, FM, Pager, APRS & 433 MHz" },
+      "ja": { "summary": "CardputerZero用 2m/70cm RTL-SDR オールモードスキャナー (DMR/YSF/FM/APRS)" },
+      "zh-CN": { "summary": "CardputerZero 2m/70cm 全模式 RTL-SDR 扫描与数字语音解码器" }
+    },
+    "categories": ["Radio & Comms", "Hardware & IoT"],
+    "screenshots": [
+      "screenshots/dmr_live.png",
+      "screenshots/spectrum.png",
+      "screenshots/modes.png",
+      "screenshots/config.png"
+    ],
+    "icon": "zerowave.png",
+    "license": "GPL-3.0-or-later",
+    "source_repo": "https://github.com/stefexec/ZeroWave",
+    "author": { "github": "stefexec", "display_name": "Gurkenwerfer" },
+    "share_code": "ZWAV",
+    "permissions": {
+      "camera": false,
+      "microphone": false,
+      "imu": false,
+      "network": true,
+      "additional_hardware": true,
+      "background_service": false,
+      "external_display": false
+    }
+  }
+}

@@ -2793,10 +2793,93 @@ class ZeroWaveApp:
         self.draw_toast()
         self.draw_esc_overlay()
 
+    def _populate_preview_state(self, mode: str) -> None:
+        # Realistic mock state for 320x170 AppStore & README screenshots
+        self.engine.db.user_count = 317420
+        self.engine.db.tg_count = 1847
+        self.engine.db._cache_id[3199020] = {
+            "callsign": "WX9USA", "first_name": "Richard", "last_name": "",
+            "city": "Clinton", "state": "Illinois", "country": "United States",
+        }
+        self.engine.db._cache_id[2624511] = {
+            "callsign": "DL1GURK", "first_name": "Stefan", "last_name": "",
+            "city": "Munich", "state": "Bavaria", "country": "Germany",
+        }
+        self.engine.db._cache_tg[91] = "World-wide"
+        self.engine.db._cache_tg[262] = "Deutschland"
+
+        # Synthetic realistic 1.8 MHz RF spectrum around 438.8 MHz
+        freqs = np.linspace(437_900_000, 439_700_000, 1536, dtype=np.float64)
+        rng = np.random.default_rng(42)
+        psd = -24.5 + rng.normal(0.0, 1.3, size=len(freqs)).astype(np.float32)
+        for f_pk, amp, wid in (
+            (438_425_000, 48.0, 7_500),
+            (438_687_500, 16.0, 5_000),
+            (439_125_000, 22.0, 8_000),
+        ):
+            psd += amp * np.exp(-0.5 * ((freqs - f_pk) / wid) ** 2).astype(np.float32)
+        self.engine.sweep_freqs = freqs
+        self.engine.sweep_psd = psd
+        self.engine.sweep_noise = -24.5
+        self.engine.sweep_peaks = [
+            PeakCandidate(freq_hz=438_425_000, power_db=23.5, snr_db=48.0, bw_hz=7200),
+            PeakCandidate(freq_hz=439_125_000, power_db=-2.5, snr_db=22.0, bw_hz=8100),
+            PeakCandidate(freq_hz=438_687_500, power_db=-8.5, snr_db=16.0, bw_hz=5000),
+        ]
+        self.engine.found_count = 4
+        self.engine.skipped_count = 2
+
+        if mode == "dmr_live":
+            self.tab_idx = 0
+            self.engine.config["app_mode"] = "VOICE"
+            self.engine.config["voice_scan"] = "AUTO"
+            self.engine.phase = "LOCKED"
+            self.engine.active_freq_hz = 438_425_000
+            self.engine.active_label = "70cm Ham DMR/DV"
+            self.engine.status_text = "DMR LOCK 438.4250"
+            now = time.time()
+            st = self.engine.dsd._state
+            st.running = True
+            st.synced = True
+            st.last_sync_at = now
+            st.last_voice_at = now
+            st.protocol = "DMR"
+            st.submode = "BS"
+            st.color_code = "1"
+            st.slot1.active = True
+            st.slot1.voice = False
+            st.slot1.tg = "262"
+            st.slot1.src = "2624511"
+            st.slot1.last_activity = now
+            st.slot2.active = True
+            st.slot2.voice = True
+            st.slot2.tg = "91"
+            st.slot2.src = "3199020"
+            st.slot2.call_type = "GROUP"
+            st.slot2.last_activity = now
+            st.raw_lines.append("SLOT 2 TGT=91 SRC=3199020 Group Call | Color Code=01")
+        elif mode == "spectrum":
+            self.tab_idx = 0
+            self.engine.config["app_mode"] = "VOICE"
+            self.engine.config["voice_scan"] = "AUTO"
+            self.engine.phase = "SWEEP"
+            self.engine.active_freq_hz = 438_800_000
+            self.engine.active_label = "70cm Ham DMR/DV"
+            self.engine.status_text = "Sweep 70cm Ham DMR/DV: 438.800 MHz"
+        elif mode in ("grid", "modes"):
+            self.tab_idx = 0
+            self.engine.phase = "SWEEP"
+            self.engine.active_freq_hz = 438_425_000
+            self.mode_grid_sel = 0
+            self.modal = "MODE_GRID"
+        elif mode == "config":
+            self.tab_idx = 4
+            self.cfg_sel = 0
+            self.engine.phase = "SWEEP"
+
     def run(self) -> None:
         if self.preview_out:
-            if self.preview_mode == "grid":
-                self.modal = "MODE_GRID"
+            self._populate_preview_state(self.preview_mode or "dmr_live")
             self.render()
             pygame.image.save(self.screen, self.preview_out)
             return

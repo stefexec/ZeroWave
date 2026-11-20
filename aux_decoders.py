@@ -12,6 +12,7 @@ import collections
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -513,14 +514,15 @@ class SondeRunner:
 
     def start(self, freq_hz: int, gain_db: int = 0, ppm: int = 0) -> None:
         self.stop()
-        if not os.path.exists("/usr/local/bin/rs41mod"):
+        rs_bin = shutil.which("rs41mod") or "/usr/local/bin/rs41mod"
+        if not os.path.exists(rs_bin):
             with self._lock:
                 self.error = "rs41mod not installed"
             return
         g_val = int(gain_db) if int(gain_db) > 0 else 40
         rtl_cmd = _rtl_fm_base(freq_hz, "fm", "48000", None, g_val, ppm, squelch=0, deemp=False)
         sox_cmd = ["sox", "-t", "raw", "-r", "48000", "-e", "signed", "-b", "16", "-c", "1", "-", "-t", "wav", "-"]
-        rs_cmd = ["stdbuf", "-oL", "/usr/local/bin/rs41mod", "--ptu", "-"]
+        rs_cmd = ["stdbuf", "-oL", rs_bin, "--ptu", "-"]
         env = _base_env()
         p1 = p2 = p3 = None
         try:
