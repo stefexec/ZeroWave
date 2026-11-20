@@ -181,7 +181,7 @@ DEFAULT_VOICE_BANDS = [
 
 DEFAULT_ANALOG_BANDS = [
     {"id": "wfm_bc", "name": "FM Broadcast (WFM)", "freq_hz": 100_000_000, "start_hz": 87_500_000, "end_hz": 108_000_000, "step_hz": 100_000, "mod": "WFM", "enabled": True},
-    {"id": "ham70_fm", "name": "70cm Ham FM Relais", "freq_hz": 438_650_000, "start_hz": 438_600_000, "end_hz": 439_425_000, "step_hz": 12_500, "mod": "NFM", "enabled": False},
+    {"id": "ham70_fm", "name": "70cm Ham FM Relais", "freq_hz": 438_650_000, "start_hz": 438_200_000, "end_hz": 439_425_000, "step_hz": 12_500, "mod": "NFM", "enabled": False},
     {"id": "ham2m_fm", "name": "2m Ham FM Relais", "freq_hz": 145_600_000, "start_hz": 145_600_000, "end_hz": 145_800_000, "step_hz": 12_500, "mod": "NFM", "enabled": False},
     {"id": "pmr_fm", "name": "PMR446 Analog", "freq_hz": 446_006_250, "start_hz": 446_006_250, "end_hz": 446_193_750, "step_hz": 12_500, "mod": "NFM", "enabled": False},
     {"id": "air_am", "name": "Airband VHF (AM)", "freq_hz": 121_500_000, "start_hz": 118_000_000, "end_hz": 136_975_000, "step_hz": 25_000, "mod": "AM", "enabled": False},

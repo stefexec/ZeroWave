@@ -85,15 +85,15 @@ class AnalogRunner:
         self.stop()
         mod_u = mod.upper()
         if mod_u == "AM":
-            rtl_cmd = _rtl_fm_base(freq_hz, "am", "12k", 24000, gain_db, ppm, squelch=squelch, deemp=False)
-            out_rate = 24000
+            rtl_cmd = _rtl_fm_base(freq_hz, "am", "12000", None, gain_db, ppm, squelch=squelch, deemp=False)
+            out_rate = 12000
         elif mod_u == "WFM":
             rtl_cmd = _rtl_fm_base(freq_hz, "wbfm", "170k", 32000, gain_db, ppm, squelch=0, deemp=True)
             out_rate = 32000
         else:
             mod_u = "NFM"
-            rtl_cmd = _rtl_fm_base(freq_hz, "fm", "12k", 24000, gain_db, ppm, squelch=squelch, deemp=True)
-            out_rate = 24000
+            rtl_cmd = _rtl_fm_base(freq_hz, "fm", "12000", None, gain_db, ppm, squelch=squelch, deemp=True)
+            out_rate = 12000
 
         pacat_cmd = [
             "pacat",
