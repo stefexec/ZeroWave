@@ -56,15 +56,13 @@ def _base_env() -> dict[str, str]:
 
 
 # ==============================================================================
-# 1) ANALOG RUNNER (NFM / AM / WFM + Optional WAV Recording)
+# 1) ANALOG RUNNER (NFM / AM / WFM via rtl_fm -> pacat)
 # ==============================================================================
 class AnalogRunner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
         self.running = False
-        self.recording = False
-        self.rec_file = ""
         self.freq_hz = 0
         self.mod = "NFM"
         self.error = ""
@@ -75,15 +73,14 @@ class AnalogRunner:
         mod: str = "NFM",
         gain_db: int = 0,
         ppm: int = 0,
-        squelch: int = 25,
-        record_dir: str | None = None,
+        squelch: int = 0,
     ) -> None:
         self.stop()
         mod_u = mod.upper()
         if mod_u == "AM":
             s_rate, out_rate, m_flag, extra = "12k", 24000, "am", ""
         elif mod_u == "WFM":
-            s_rate, out_rate, m_flag, extra = "200k", 48000, "wbfm", "-E deemp"
+            s_rate, out_rate, m_flag, extra = "170k", 32000, "wbfm", "-E deemp"
         else:
             mod_u = "NFM"
             s_rate, out_rate, m_flag, extra = "12k", 24000, "fm", "-E deemp"
@@ -94,24 +91,7 @@ class AnalogRunner:
 
         rtl_cmd = f"rtl_fm -f {int(freq_hz)} -M {m_flag} -s {s_rate} -r {out_rate} {g_arg} {p_arg} {sq_arg} {extra} -E dc"
         pacat_cmd = f"pacat --format=s16le --rate={out_rate} --channels=1 --latency-msec=100"
-
-        rec_file = ""
-        if record_dir:
-            try:
-                os.makedirs(record_dir, exist_ok=True)
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                rec_file = os.path.join(record_dir, f"ANALOG_{mod_u}_{int(freq_hz)}_{ts}.wav")
-                # Split stream: play to speakers AND record raw PCM to wav via sox
-                shell_cmd = (
-                    f"{rtl_cmd} 2>/dev/null | "
-                    f"tee >(sox -t raw -r {out_rate} -e signed -b 16 -c 1 - '{rec_file}' 2>/dev/null) | "
-                    f"{pacat_cmd} 2>/dev/null"
-                )
-            except Exception:
-                rec_file = ""
-                shell_cmd = f"{rtl_cmd} 2>/dev/null | {pacat_cmd} 2>/dev/null"
-        else:
-            shell_cmd = f"{rtl_cmd} 2>/dev/null | {pacat_cmd} 2>/dev/null"
+        shell_cmd = f"{rtl_cmd} 2>/dev/null | {pacat_cmd} 2>/dev/null"
 
         try:
             proc = subprocess.Popen(
@@ -125,8 +105,6 @@ class AnalogRunner:
             with self._lock:
                 self._proc = proc
                 self.running = True
-                self.recording = bool(rec_file)
-                self.rec_file = rec_file
                 self.freq_hz = int(freq_hz)
                 self.mod = mod_u
                 self.error = ""
@@ -140,7 +118,6 @@ class AnalogRunner:
             proc = self._proc
             self._proc = None
             self.running = False
-            self.recording = False
         _kill_proc(proc)
 
 
@@ -148,7 +125,7 @@ class AnalogRunner:
 # 2) PAGER RUNNER (POCSAG 512/1200/2400 + FLEX via multimon-ng)
 # ==============================================================================
 POCSAG_RE = re.compile(
-    r"^(POCSAG\d+|FLEX)[:|]\s*(?:Address:\s*(\d+)\s+Function:\s*(\d+)\s+(?:Alpha|Numeric):\s*(.*)|.*\|\s*(\d+)\s*\|\s*ALN\s*\|\s*(.*))$",
+    r"^(POCSAG\d+|FLEX)[:|]\s*(?:Address:\s*(\d+)\s+Function:\s*(\d+)\s+(?:Alpha|Numeric|Skyper):\s*(.*)|.*\|\s*(\d+)\s*\|\s*(?:ALN|NUM)\s*\|\s*(.*))$",
     re.IGNORECASE,
 )
 
@@ -166,11 +143,12 @@ class PagerRunner:
 
     def start(self, freq_hz: int, gain_db: int = 0, ppm: int = 0) -> None:
         self.stop()
-        g_arg = f"-g {int(gain_db)}" if int(gain_db) > 0 else ""
+        # Use decent manual gain if AUTO is set, since rtl_fm AGC can miss brief POCSAG bursts
+        g_val = int(gain_db) if int(gain_db) > 0 else 40
         p_arg = f"-p {int(ppm)}" if int(ppm) != 0 else ""
         shell_cmd = (
-            f"rtl_fm -f {int(freq_hz)} -M fm -s 22050 {g_arg} {p_arg} -E dc 2>/dev/null | "
-            f"stdbuf -oL multimon-ng -t raw -a POCSAG512 -a POCSAG1200 -a POCSAG2400 -a FLEX -f alpha -u - 2>/dev/null"
+            f"rtl_fm -f {int(freq_hz)} -M fm -s 22050 -g {g_val} {p_arg} -E dc 2>/dev/null | "
+            f"stdbuf -oL multimon-ng -t raw -a POCSAG512 -a POCSAG1200 -a POCSAG2400 -a FLEX -f auto -e -u - 2>/dev/null"
         )
         try:
             proc = subprocess.Popen(
@@ -269,10 +247,10 @@ class AprsRunner:
 
     def start(self, freq_hz: int, gain_db: int = 0, ppm: int = 0) -> None:
         self.stop()
-        g_arg = f"-g {int(gain_db)}" if int(gain_db) > 0 else ""
+        g_val = int(gain_db) if int(gain_db) > 0 else 40
         p_arg = f"-p {int(ppm)}" if int(ppm) != 0 else ""
         shell_cmd = (
-            f"rtl_fm -f {int(freq_hz)} -M fm -s 22050 {g_arg} {p_arg} -E dc 2>/dev/null | "
+            f"rtl_fm -f {int(freq_hz)} -M fm -s 22050 -g {g_val} {p_arg} -E dc 2>/dev/null | "
             f"stdbuf -oL multimon-ng -t raw -a AFSK1200 -A - 2>/dev/null"
         )
         try:

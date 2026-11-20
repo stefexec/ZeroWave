@@ -237,7 +237,7 @@ def fmt_mhz_short(freq_hz: int) -> str:
 
 
 # ==============================================================================
-# AUDIO CONTROL (PipeWire / PulseAudio + Recording Playback)
+# AUDIO CONTROL (PipeWire / PulseAudio + Seamless Live WAV Recording & Playback)
 # ==============================================================================
 class AudioControl:
     def __init__(self) -> None:
@@ -245,6 +245,9 @@ class AudioControl:
         self.muted = False
         self._play_proc: subprocess.Popen | None = None
         self.playing_file = ""
+        self._rec_proc: subprocess.Popen | None = None
+        self.rec_file = ""
+        self.rec_started_at = 0.0
         self._sync_from_system()
 
     def _env(self) -> dict[str, str]:
@@ -288,6 +291,66 @@ class AudioControl:
             daemon=True,
         ).start()
         return self.muted
+
+    def start_recording(self, tag: str) -> str:
+        """
+        Seamless live WAV recording directly from PipeWire @DEFAULT_MONITOR@.
+        Never restarts dsd-fme or rtl_fm — zero audio drop, zero return to scan screen!
+        """
+        self.stop_recording()
+        os.makedirs(REC_DIR, exist_ok=True)
+        safe_tag = "".join(c if c.isalnum() or c in "._-" else "_" for c in tag)[:36]
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fname = f"{safe_tag}_{ts}.wav"
+        fpath = os.path.join(REC_DIR, fname)
+        try:
+            self._rec_proc = subprocess.Popen(
+                [
+                    "parec",
+                    "-d", "@DEFAULT_MONITOR@",
+                    "--file-format=wav",
+                    "--rate=16000",
+                    "--channels=1",
+                    "--format=s16le",
+                    fpath,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                env=self._env(),
+            )
+            self.rec_file = fname
+            self.rec_started_at = time.time()
+            return fname
+        except Exception:
+            self._rec_proc = None
+            self.rec_file = ""
+            return ""
+
+    def stop_recording(self) -> str:
+        fn = self.rec_file
+        proc = self._rec_proc
+        self._rec_proc = None
+        self.rec_file = ""
+        self.rec_started_at = 0.0
+        if proc is not None:
+            try:
+                # SIGINT lets parec cleanly flush and finalize the WAV header
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=1.5)
+            except Exception:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    pass
+        return fn
+
+    def is_recording(self) -> bool:
+        if self._rec_proc is not None and self._rec_proc.poll() is not None:
+            self._rec_proc = None
+            self.rec_file = ""
+        return self._rec_proc is not None
 
     def play_wav(self, path: str) -> None:
         self.stop_playback()
@@ -356,7 +419,7 @@ class ZeroWaveEngine:
             "manual_freq_hz": 438_425_000,
             "analog_freq_hz": 145_600_000,
             "analog_mod": "NFM",          # NFM, AM, WFM
-            "analog_squelch": 28,
+            "analog_squelch": 0,
             "analog_scan": False,
             "analog_band_idx": 0,
             "pager_freq_hz": 439_987_500,
@@ -752,7 +815,6 @@ class ZeroWaveEngine:
             bw_khz=int(cfg.get("bw_khz", 12)),
             squelch=0,
             vol=2,
-            record_dir=REC_DIR if cfg.get("recording") else None,
         )
 
         while not self._stop_evt.is_set() and not self._interrupt_evt.is_set():
@@ -905,7 +967,6 @@ class ZeroWaveEngine:
             bw_khz=int(cfg.get("bw_khz", 12)),
             squelch=0,
             vol=2,
-            record_dir=REC_DIR if cfg.get("recording") else None,
         )
 
         t_start = time.time()
@@ -1003,8 +1064,7 @@ class ZeroWaveEngine:
                     self.analog.start(
                         freq_hz=pk.freq_hz, mod=mod,
                         gain_db=int(cfg["gain_db"]), ppm=int(cfg["ppm"]),
-                        squelch=int(cfg.get("analog_squelch", 28)),
-                        record_dir=REC_DIR if cfg.get("recording") else None,
+                        squelch=int(cfg.get("analog_squelch", 0)),
                     )
                     t0 = time.time()
                     while not self._stop_evt.is_set() and not self._interrupt_evt.is_set():
@@ -1027,8 +1087,7 @@ class ZeroWaveEngine:
         self.analog.start(
             freq_hz=freq, mod=mod,
             gain_db=int(cfg["gain_db"]), ppm=int(cfg["ppm"]),
-            squelch=int(cfg.get("analog_squelch", 28)),
-            record_dir=REC_DIR if cfg.get("recording") else None,
+            squelch=int(cfg.get("analog_squelch", 0)),
         )
         while not self._stop_evt.is_set() and not self._interrupt_evt.is_set():
             self._interrupt_evt.wait(0.2)
@@ -1389,15 +1448,39 @@ class ZeroWaveApp:
         elif self.tab_idx == 4:
             self._key_cfg(code)
 
+    def _toggle_seamless_rec(self) -> None:
+        if self.audio.is_recording():
+            fn = self.audio.stop_recording()
+            self.show_toast(f"Saved: {fn[:28]}" if fn else "Recording stopped")
+            return
+        with self.engine.lock:
+            am = self.engine.config["app_mode"]
+            freq = fmt_mhz(self.engine.active_freq_hz)
+        if am == "VOICE":
+            dsd = self.engine.dsd.get_state()
+            proto = dsd.protocol or "DV"
+            tg = dsd.slot1.tg or dsd.slot2.tg
+            src = dsd.slot1.src or dsd.slot2.src
+            op = self.engine.db.lookup_id(src) if src else None
+            who = op["callsign"] if (op and op["callsign"]) else src
+            parts = [proto, freq]
+            if tg:
+                parts.append(f"TG{tg}")
+            if who:
+                parts.append(who)
+            tag = "_".join(parts)
+        elif am == "ANALOG":
+            tag = f"{self.engine.config.get('analog_mod', 'NFM')}_{freq}"
+        else:
+            tag = f"{am}_{freq}"
+        fn = self.audio.start_recording(tag)
+        self.show_toast("REC started (live, zero-drop)" if fn else "REC failed (parec)")
+
     def _key_live(self, code: int) -> None:
         am = self.engine.config["app_mode"]
 
         if code == KEY_R:
-            if am in ("VOICE", "ANALOG"):
-                rec = self.engine.toggle_recording()
-                self.show_toast("REC ON -> ~/ZeroWave_Recordings" if rec else "REC OFF")
-            else:
-                self.show_toast("Recording is for VOICE & ANALOG")
+            self._toggle_seamless_rec()
             return
 
         if code == KEY_SPACE:
@@ -1687,7 +1770,8 @@ class ZeroWaveApp:
             idx = flags.index(cfg["decoder_flag"]) if cfg["decoder_flag"] in flags else 0
             cfg["decoder_flag"] = flags[(idx + delta) % len(flags)]
         elif self.cfg_sel == 2:  # Recording
-            cfg["recording"] = not cfg.get("recording", False)
+            self._toggle_seamless_rec()
+            return
         elif self.cfg_sel == 3:  # Gain
             g = int(cfg["gain_db"])
             idx = GAIN_OPTIONS.index(g) if g in GAIN_OPTIONS else 0
@@ -1863,7 +1947,7 @@ class ZeroWaveApp:
         pygame.draw.rect(self.screen, p_bg, (rx, 3, pw, 13), border_radius=3)
         self.screen.blit(psurf, (rx + (pw - psurf.get_width()) // 2, 5))
 
-        if rec and am in ("VOICE", "ANALOG"):
+        if self.audio.is_recording():
             rx -= 16
             pygame.draw.rect(self.screen, DANGER_DARK, (rx, 3, 14, 13), border_radius=3)
             pygame.draw.circle(self.screen, DANGER, (rx + 7, 9), 3)
@@ -1944,8 +2028,9 @@ class ZeroWaveApp:
         x += self._pill(x, 53, f"{cc_lbl}:{cc}", CYAN, CYAN_DARK) + 4
         enc = dsd.slot1.encrypted or dsd.slot2.encrypted
         x += self._pill(x, 53, "ENC" if enc else "CLEAR", DANGER if enc else MINT, DANGER_DARK if enc else MINT_DARK) + 4
-        if dsd.recording:
-            x += self._pill(x, 53, "REC", DANGER, DANGER_DARK) + 4
+        if self.audio.is_recording():
+            sec = int(max(0, time.time() - self.audio.rec_started_at))
+            x += self._pill(x, 53, f"REC {sec // 60}:{sec % 60:02d}", DANGER, DANGER_DARK) + 4
         if hold:
             self._pill(x, 53, "HOLD", WARN, WARN_DARK)
 
@@ -2032,8 +2117,9 @@ class ZeroWaveApp:
             x = cx + 8
             x += self._pill(x, cy + 8, f"MODE: {mod}", PINK, PINK_DARK) + 6
             x += self._pill(x, cy + 8, f"SQUELCH: {sq}", CYAN, CYAN_DARK) + 6
-            if self.engine.analog.recording:
-                self._pill(x, cy + 8, "REC WAV", DANGER, DANGER_DARK)
+            if self.audio.is_recording():
+                sec = int(max(0, time.time() - self.audio.rec_started_at))
+                self._pill(x, cy + 8, f"REC {sec // 60}:{sec % 60:02d}", DANGER, DANGER_DARK)
             self.screen.blit(self.f_sm_b.render("Analog Audio Receiver Active" if self.engine.analog.running else status[:36], True, TEXT), (cx + 8, cy + 32))
             step_lbl = "100kHz" if mod == "WFM" else ("25kHz" if mod == "AM" else "12.5kHz")
             self.screen.blit(self.f_mono.render(f"Step: LEFT/RIGHT +/-{step_lbl}   UP/DN +/-100k", True, SUBTEXT), (cx + 8, cy + 54))
@@ -2397,7 +2483,7 @@ class ZeroWaveApp:
         items = [
             ("Callsign+TG DB", db_val),
             ("Digital Decoder", mode_name),
-            ("WAV Recording (R)", "ON" if cfg.get("recording") else "OFF"),
+            ("WAV Recording (R)", "REC ON" if self.audio.is_recording() else "OFF"),
             ("RTL Gain", gain_str),
             ("RTL Bandwidth", f"{int(cfg.get('bw_khz', 12))} kHz"),
             ("Analog Squelch", str(int(cfg.get("analog_squelch", 28)))),
@@ -2568,6 +2654,7 @@ class ZeroWaveApp:
                 if dt < 0.04:
                     time.sleep(0.04 - dt)
         finally:
+            self.audio.stop_recording()
             self.audio.stop_playback()
             self.engine.stop()
             for fd in self.kbd_fds:
