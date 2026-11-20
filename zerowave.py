@@ -179,14 +179,14 @@ DEFAULT_VOICE_BANDS = [
     {"id": "custom", "name": "Custom Band", "start_hz": 438_000_000, "end_hz": 440_000_000, "step_hz": 12_500, "enabled": False},
 ]
 
-ANALOG_PRESETS = [
-    {"name": "2m Ham FM Relais", "freq_hz": 145_600_000, "start_hz": 145_600_000, "end_hz": 145_800_000, "step_hz": 12_500, "mod": "NFM"},
-    {"name": "70cm Ham FM Relais", "freq_hz": 438_650_000, "start_hz": 438_600_000, "end_hz": 439_425_000, "step_hz": 12_500, "mod": "NFM"},
-    {"name": "PMR446 Analog Ch1-16", "freq_hz": 446_006_250, "start_hz": 446_006_250, "end_hz": 446_193_750, "step_hz": 12_500, "mod": "NFM"},
-    {"name": "Airband VHF (AM)", "freq_hz": 121_500_000, "start_hz": 118_000_000, "end_hz": 136_975_000, "step_hz": 25_000, "mod": "AM"},
-    {"name": "Marine VHF Ch16", "freq_hz": 156_800_000, "start_hz": 156_000_000, "end_hz": 157_425_000, "step_hz": 25_000, "mod": "NFM"},
-    {"name": "Freenet 149 MHz", "freq_hz": 149_025_000, "start_hz": 149_025_000, "end_hz": 149_112_500, "step_hz": 12_500, "mod": "NFM"},
-    {"name": "FM Broadcast (WFM)", "freq_hz": 100_000_000, "start_hz": 87_500_000, "end_hz": 108_000_000, "step_hz": 100_000, "mod": "WFM"},
+DEFAULT_ANALOG_BANDS = [
+    {"id": "wfm_bc", "name": "FM Broadcast (WFM)", "freq_hz": 100_000_000, "start_hz": 87_500_000, "end_hz": 108_000_000, "step_hz": 100_000, "mod": "WFM", "enabled": True},
+    {"id": "ham70_fm", "name": "70cm Ham FM Relais", "freq_hz": 438_650_000, "start_hz": 438_600_000, "end_hz": 439_425_000, "step_hz": 12_500, "mod": "NFM", "enabled": False},
+    {"id": "ham2m_fm", "name": "2m Ham FM Relais", "freq_hz": 145_600_000, "start_hz": 145_600_000, "end_hz": 145_800_000, "step_hz": 12_500, "mod": "NFM", "enabled": False},
+    {"id": "pmr_fm", "name": "PMR446 Analog", "freq_hz": 446_006_250, "start_hz": 446_006_250, "end_hz": 446_193_750, "step_hz": 12_500, "mod": "NFM", "enabled": False},
+    {"id": "air_am", "name": "Airband VHF (AM)", "freq_hz": 121_500_000, "start_hz": 118_000_000, "end_hz": 136_975_000, "step_hz": 25_000, "mod": "AM", "enabled": False},
+    {"id": "marine", "name": "Marine VHF Ch16", "freq_hz": 156_800_000, "start_hz": 156_000_000, "end_hz": 157_425_000, "step_hz": 25_000, "mod": "NFM", "enabled": False},
+    {"id": "freenet", "name": "Freenet 149 MHz", "freq_hz": 149_025_000, "start_hz": 149_025_000, "end_hz": 149_112_500, "step_hz": 12_500, "mod": "NFM", "enabled": False},
 ]
 
 PAGER_PRESETS = [
@@ -416,11 +416,11 @@ class ZeroWaveEngine:
             "cooldown_sec": 22.0,
             "auto_save_found": True,
             "manual_freq_hz": 438_425_000,
-            "analog_freq_hz": 145_600_000,
-            "analog_mod": "NFM",          # NFM, AM, WFM
+            "analog_freq_hz": 100_000_000,
+            "analog_mod": "WFM",          # NFM, AM, WFM
             "analog_squelch": 0,
-            "analog_scan": False,
-            "analog_band_idx": 0,
+            "analog_scan": True,
+            "analog_bands": [dict(b) for b in DEFAULT_ANALOG_BANDS],
             "pager_freq_hz": 439_987_500,
             "aprs_freq_hz": 144_800_000,
             "ism_freq_hz": 433_920_000,
@@ -455,6 +455,7 @@ class ZeroWaveEngine:
 
         self._stop_evt = threading.Event()
         self._interrupt_evt = threading.Event()
+        self._tune_debounce_until = 0.0
         self._thread: threading.Thread | None = None
 
     # --- Persistence ----------------------------------------------------------
@@ -534,6 +535,15 @@ class ZeroWaveEngine:
             pass
 
     def _stop_all_backends(self) -> None:
+        was_active = any((
+            self.dsd.get_state().running,
+            self.analog.running,
+            self.pager.running,
+            self.aprs.running,
+            self.ism.running,
+            self.sonde.running,
+            self.sweeper.is_open,
+        ))
         self.dsd.stop()
         self.analog.stop()
         self.pager.stop()
@@ -541,6 +551,9 @@ class ZeroWaveEngine:
         self.ism.stop()
         self.sonde.stop()
         self.sweeper.close()
+        # Brief USB settle pause prevents rapid open/close bus resets on dwc2
+        if was_active:
+            time.sleep(0.12)
 
     # --- Public controls ------------------------------------------------------
     def start(self) -> None:
@@ -624,6 +637,7 @@ class ZeroWaveEngine:
                         delta_hz = 25_000 if delta_hz > 0 else -25_000
                 elif abs(delta_hz) == 100_000 and mod == "WFM":
                     delta_hz = 1_000_000 if delta_hz > 0 else -1_000_000
+            self._tune_debounce_until = time.time() + 0.22
             self.tune_freq(cur + delta_hz)
 
     def cycle_analog_mod(self) -> str:
@@ -742,6 +756,12 @@ class ZeroWaveEngine:
     def _worker_loop(self) -> None:
         while not self._stop_evt.is_set():
             self._interrupt_evt.clear()
+            # Debounce rapid frequency stepping so we don't hammer the USB dongle
+            with self.lock:
+                deb = self._tune_debounce_until - time.time()
+            if deb > 0:
+                self._interrupt_evt.wait(min(0.25, deb))
+                continue
             with self.lock:
                 app_mode = self.config["app_mode"]
                 paused = self.paused
@@ -1017,72 +1037,99 @@ class ZeroWaveEngine:
             self.dsd.stop()
         return locked
 
-    # --- 2) ANALOG MODE (NFM / AM / WFM + Band Scan) --------------------------
+    # --- 2) ANALOG MODE (Unified AUTO Spectrum Sweep <-> TUNER like VOICE!) ---
     def _run_analog_mode(self) -> None:
         self._stop_all_backends()
         with self.lock:
             cfg = dict(self.config)
-            do_scan = bool(cfg.get("analog_scan", False))
-            mod = str(cfg.get("analog_mod", "NFM"))
+            do_scan = bool(cfg.get("analog_scan", True))
+            mod = str(cfg.get("analog_mod", "WFM"))
+            abands = [dict(b) for b in cfg.get("analog_bands", DEFAULT_ANALOG_BANDS) if b.get("enabled")]
 
         if do_scan:
-            idx = int(cfg.get("analog_band_idx", 0)) % len(ANALOG_PRESETS)
-            p = ANALOG_PRESETS[idx]
-            mod = p["mod"]
+            if not abands:
+                with self.lock:
+                    self.phase = "IDLE"
+                    self.status_text = "No analog band ON! Open 2:BAND."
+                self._interrupt_evt.wait(0.6)
+                return
+
             gain = None if int(cfg["gain_db"]) == 0 else float(cfg["gain_db"])
             self.sweeper.open(gain_db=gain, ppm=int(cfg["ppm"]))
-            centers = plan_band_centers(p["start_hz"], p["end_hz"])
-            for center in centers:
+
+            for band in abands:
                 if self._interrupt_evt.is_set() or self._stop_evt.is_set():
                     return
-                with self.lock:
-                    self.phase = "SWEEP"
-                    self.active_freq_hz = center
-                    self.active_label = f"{p['name']} ({mod})"
-                    self.status_text = f"Analog Sweep {fmt_mhz_short(center)} MHz"
-                freqs, psd, nf = self.sweeper.capture_psd(center, burst_ms=50)
-                max_bw = 240_000 if mod == "WFM" else 32_000
-                peaks = self.sweeper.find_peaks_in_window(
-                    freqs, psd, nf, p["start_hz"], p["end_hz"],
-                    step_hz=p["step_hz"], threshold_db=float(cfg["threshold_db"]),
-                    min_bw_hz=2_000, max_bw_hz=max_bw, ignore_fn=self._is_ignored,
-                )
-                with self.lock:
-                    self.sweep_freqs = freqs
-                    self.sweep_psd = psd
-                    self.sweep_noise = nf
-                    self.sweep_peaks = peaks
-                if peaks:
-                    pk = peaks[0]
-                    self.sweeper.close()
+                bmod = str(band.get("mod", "NFM"))
+                bname = str(band["name"])
+                start_hz = int(band["start_hz"])
+                end_hz = int(band["end_hz"])
+                step_hz = int(band.get("step_hz", 12_500))
+                centers = plan_band_centers(start_hz, end_hz)
+
+                for center in centers:
+                    if self._interrupt_evt.is_set() or self._stop_evt.is_set():
+                        return
                     with self.lock:
-                        self.phase = "LOCKED"
-                        self.active_freq_hz = pk.freq_hz
-                        self.active_snr_db = pk.snr_db
-                        self.status_text = f"{mod} Signal +{pk.snr_db:.0f}dB (B:Skip)"
-                    self.analog.start(
-                        freq_hz=pk.freq_hz, mod=mod,
-                        gain_db=int(cfg["gain_db"]), ppm=int(cfg["ppm"]),
-                        squelch=int(cfg.get("analog_squelch", 0)),
+                        self.phase = "SWEEP"
+                        self.config["analog_mod"] = bmod
+                        self.active_freq_hz = center
+                        self.active_label = bname
+                        self.status_text = f"Sweep {bname}: {fmt_mhz_short(center)} MHz"
+                        self.error_text = ""
+
+                    freqs, psd, nf = self.sweeper.capture_psd(center, burst_ms=55)
+                    max_bw = 260_000 if bmod == "WFM" else 34_000
+                    min_bw = 25_000 if bmod == "WFM" else 2_500
+                    peaks = self.sweeper.find_peaks_in_window(
+                        freqs, psd, nf, start_hz, end_hz,
+                        step_hz=step_hz, threshold_db=float(cfg["threshold_db"]),
+                        min_bw_hz=min_bw, max_bw_hz=max_bw, ignore_fn=self._is_ignored,
                     )
-                    t0 = time.time()
-                    while not self._stop_evt.is_set() and not self._interrupt_evt.is_set():
+                    with self.lock:
+                        self.sweep_freqs = freqs
+                        self.sweep_psd = psd
+                        self.sweep_noise = nf
+                        self.sweep_peaks = peaks
+
+                    if peaks:
+                        pk = peaks[0]
+                        self.sweeper.close()
+                        time.sleep(0.12)
                         with self.lock:
-                            h = self.hold
-                        if not h and (time.time() - t0) >= 8.0:
-                            break
-                        self._interrupt_evt.wait(0.15)
-                    self.analog.stop()
-                    return
+                            self.phase = "LOCKED"
+                            self.active_freq_hz = pk.freq_hz
+                            self.active_label = bname
+                            self.active_snr_db = pk.snr_db
+                            self.status_text = f"{bmod} LOCK +{pk.snr_db:.0f}dB (B:Next SPC:Hold)"
+                        self.analog.start(
+                            freq_hz=pk.freq_hz, mod=bmod,
+                            gain_db=int(cfg["gain_db"]), ppm=int(cfg["ppm"]),
+                            squelch=int(cfg.get("analog_squelch", 0)),
+                        )
+                        t0 = time.time()
+                        while not self._stop_evt.is_set() and not self._interrupt_evt.is_set():
+                            with self.lock:
+                                is_hold = self.hold
+                            if not is_hold and (time.time() - t0) >= 12.0:
+                                with self.lock:
+                                    self.cooldowns[pk.freq_hz] = time.time() + float(cfg["cooldown_sec"])
+                                break
+                            self._interrupt_evt.wait(0.15)
+                        self.analog.stop()
+                        time.sleep(0.12)
+                        if self._interrupt_evt.is_set() or self._stop_evt.is_set():
+                            return
+                        self.sweeper.open(gain_db=gain, ppm=int(cfg["ppm"]))
             return
 
         # Direct Analog Tuner
-        freq = int(cfg.get("analog_freq_hz", 145_600_000))
+        freq = int(cfg.get("analog_freq_hz", 100_000_000))
         with self.lock:
             self.active_freq_hz = freq
             self.active_label = f"Analog {mod}"
             self.phase = "TUNER"
-            self.status_text = f"{mod} {fmt_mhz(freq)} MHz | SQ:{cfg.get('analog_squelch', 28)}"
+            self.status_text = f"{mod} {fmt_mhz(freq)} MHz | SQ:{cfg.get('analog_squelch', 0)}"
         self.analog.start(
             freq_hz=freq, mod=mod,
             gain_db=int(cfg["gain_db"]), ppm=int(cfg["ppm"]),
@@ -1604,7 +1651,32 @@ class ZeroWaveApp:
                 ]
             return
 
-        # Presets for ANALOG / PAGER / APRS / ISM433 / SONDE
+        if am == "ANALOG":
+            bands = self.engine.config.get("analog_bands", DEFAULT_ANALOG_BANDS)
+            self.band_sel = max(0, min(len(bands) - 1, self.band_sel))
+            if code == KEY_UP:
+                self.band_sel = (self.band_sel - 1) % len(bands)
+            elif code == KEY_DOWN:
+                self.band_sel = (self.band_sel + 1) % len(bands)
+            elif code in (KEY_SPACE, KEY_ENTER):
+                bands[self.band_sel]["enabled"] = not bands[self.band_sel].get("enabled", False)
+                self.engine.config["analog_bands"] = bands
+                self.engine.notify_config_changed()
+                self.show_toast(f"{bands[self.band_sel]['name'][:18]}: {'ON' if bands[self.band_sel]['enabled'] else 'OFF'}")
+            elif code == KEY_A:
+                self.engine.config["analog_scan"] = True
+                self.engine.notify_config_changed()
+                self.tab_idx = 0
+                self.show_toast("Started Analog AUTO Scan")
+            elif code == KEY_T:
+                b = bands[self.band_sel]
+                self.engine.config["analog_mod"] = b["mod"]
+                self.engine.tune_freq(b["freq_hz"], b["name"])
+                self.tab_idx = 0
+                self.show_toast(f"Tuned {b['name'][:20]}")
+            return
+
+        # Presets for PAGER / APRS / ISM433 / SONDE
         presets = self._current_mode_presets()
         if not presets:
             return
@@ -1615,30 +1687,16 @@ class ZeroWaveApp:
             self.band_sel = (self.band_sel + 1) % len(presets)
         elif code in (KEY_ENTER, KEY_SPACE):
             p = presets[self.band_sel]
-            if am == "ANALOG":
-                self.engine.config["analog_mod"] = p["mod"]
-                self.engine.config["analog_band_idx"] = self.band_sel
-                self.engine.tune_freq(p["freq_hz"], p["name"])
-            elif am == "SONDE" and p["freq_hz"] == 0:
+            if am == "SONDE" and p["freq_hz"] == 0:
                 self.engine.config["sonde_sweep"] = True
                 self.engine.notify_config_changed()
             else:
                 self.engine.tune_freq(p["freq_hz"], p["name"])
             self.tab_idx = 0
             self.show_toast(f"Selected: {p['name'][:22]}")
-        elif code == KEY_A and am == "ANALOG":
-            p = presets[self.band_sel]
-            self.engine.config["analog_mod"] = p["mod"]
-            self.engine.config["analog_band_idx"] = self.band_sel
-            self.engine.config["analog_scan"] = True
-            self.engine.notify_config_changed()
-            self.tab_idx = 0
-            self.show_toast(f"Scanning {p['name'][:20]}")
 
     def _current_mode_presets(self) -> list[dict]:
         am = self.engine.config["app_mode"]
-        if am == "ANALOG":
-            return ANALOG_PRESETS
         if am == "PAGER":
             return PAGER_PRESETS
         if am == "APRS":
@@ -2094,10 +2152,12 @@ class ZeroWaveApp:
     def _draw_live_analog(self) -> None:
         with self.engine.lock:
             freq_hz = self.engine.active_freq_hz
-            mod = str(self.engine.config.get("analog_mod", "NFM"))
-            sq = int(self.engine.config.get("analog_squelch", 28))
-            scanning = bool(self.engine.config.get("analog_scan", False))
+            mod = str(self.engine.config.get("analog_mod", "WFM"))
+            sq = int(self.engine.config.get("analog_squelch", 0))
+            scanning = bool(self.engine.config.get("analog_scan", True))
             phase = self.engine.phase
+            hold = self.engine.hold
+            snr = self.engine.active_snr_db
             label = self.engine.active_label
             status = self.engine.status_text
             freqs = self.engine.sweep_freqs
@@ -2106,25 +2166,31 @@ class ZeroWaveApp:
             peaks = list(self.engine.sweep_peaks)
             thr = float(self.engine.config["threshold_db"])
 
-        self._draw_freq_card(freq_hz, mod, PINK, label or f"Analog {mod}", locked=(phase == "LOCKED"))
-        if scanning and phase == "SWEEP":
+        badge = f"{mod}:AUTO" if scanning else f"{mod}:TUNE"
+        self._draw_freq_card(freq_hz, badge, PINK, label or f"Analog {mod}", locked=(phase == "LOCKED"))
+        if scanning and phase != "LOCKED":
             self._draw_spectrum_panel(freqs, psd, nf, thr, peaks, phase, status, 0, 0)
         else:
             cx, cy, cw, ch = 6, 54, W - 12, 96
             pygame.draw.rect(self.screen, SURFACE, (cx, cy, cw, ch), border_radius=4)
-            pygame.draw.rect(self.screen, PINK if self.engine.analog.running else BORDER, (cx, cy, cw, ch), 1, border_radius=4)
+            pygame.draw.rect(self.screen, GREEN if phase == "LOCKED" else (PINK if self.engine.analog.running else BORDER), (cx, cy, cw, ch), 1, border_radius=4)
             x = cx + 8
-            x += self._pill(x, cy + 8, f"MODE: {mod}", PINK, PINK_DARK) + 6
-            x += self._pill(x, cy + 8, f"SQUELCH: {sq}", CYAN, CYAN_DARK) + 6
+            x += self._pill(x, cy + 8, f"MOD: {mod}", PINK, PINK_DARK) + 5
+            x += self._pill(x, cy + 8, f"SQ: {sq}", CYAN, CYAN_DARK) + 5
+            if phase == "LOCKED" and snr > 0:
+                x += self._pill(x, cy + 8, f"+{snr:.0f}dB", GREEN, GREEN_DARK) + 5
+            if hold:
+                x += self._pill(x, cy + 8, "HOLD", WARN, WARN_DARK) + 5
             if self.audio.is_recording():
                 sec = int(max(0, time.time() - self.audio.rec_started_at))
                 self._pill(x, cy + 8, f"REC {sec // 60}:{sec % 60:02d}", DANGER, DANGER_DARK)
-            self.screen.blit(self.f_sm_b.render("Analog Audio Receiver Active" if self.engine.analog.running else status[:36], True, TEXT), (cx + 8, cy + 32))
+            headline = f"Locked: {label}" if phase == "LOCKED" else ("Analog Audio Active" if self.engine.analog.running else status)
+            self.screen.blit(self.f_sm_b.render(headline[:38], True, TEXT), (cx + 8, cy + 32))
             step_lbl = "100kHz" if mod == "WFM" else ("25kHz" if mod == "AM" else "12.5kHz")
-            self.screen.blit(self.f_mono.render(f"Step: LEFT/RIGHT +/-{step_lbl}   UP/DN +/-100k", True, SUBTEXT), (cx + 8, cy + 54))
-            self.screen.blit(self.f_mono.render("Press A: NFM/AM/WFM   M: Band Scan   R: Rec", True, MINT), (cx + 8, cy + 72))
+            self.screen.blit(self.f_mono.render(f"Step: LEFT/RIGHT +/-{step_lbl}  B:Next Station", True, SUBTEXT), (cx + 8, cy + 54))
+            self.screen.blit(self.f_mono.render("SPC:Hold  M:Auto/Tune  A:NFM/AM/WFM  R:Rec", True, MINT), (cx + 8, cy + 72))
 
-        self.draw_footer("Q:Mode A:Mod M:Scan R:Rec F:Freq ←/→:Step")
+        self.draw_footer("Q:Mode SPC:Hold M:Auto/Tune A:Mod B:Next R:Rec")
 
     def _draw_live_pager(self) -> None:
         with self.engine.lock:
@@ -2343,6 +2409,28 @@ class ZeroWaveApp:
             self.draw_footer("SPC/ENT:Toggle  E:Edit Band  A:Start AUTO Scan")
             return
 
+        if am == "ANALOG":
+            bands = self.engine.config.get("analog_bands", DEFAULT_ANALOG_BANDS)
+            vis = 6
+            self.band_sel = max(0, min(len(bands) - 1, self.band_sel))
+            start = max(0, min(max(0, len(bands) - vis), self.band_sel - vis // 2))
+            y = 24
+            for i in range(start, min(len(bands), start + vis)):
+                b = bands[i]
+                sel = i == self.band_sel
+                en = bool(b.get("enabled", False))
+                pygame.draw.rect(self.screen, ELEVATED if sel else SURFACE, (4, y, W - 8, 20), border_radius=3)
+                if sel:
+                    pygame.draw.rect(self.screen, PINK, (4, y, W - 8, 20), 1, border_radius=3)
+                self.screen.blit(self.f_mono_b.render("[x]" if en else "[ ]", True, PINK if en else MUTED), (8, y + 4))
+                self.screen.blit(self.f_xs_b.render(b["name"][:18], True, TEXT if en else SUBTEXT), (34, y + 5))
+                rng = f"{b['start_hz']/1e6:.1f}-{b['end_hz']/1e6:.1f} {b['mod']}"
+                rs = self.f_xxs.render(rng, True, CYAN if en else MUTED)
+                self.screen.blit(rs, (W - 10 - rs.get_width(), y + 6))
+                y += 21
+            self.draw_footer("SPC/ENT:Toggle  A:Start AUTO Scan  T:Direct Tune")
+            return
+
         presets = self._current_mode_presets()
         vis = 6
         self.band_sel = max(0, min(max(0, len(presets) - 1), self.band_sel))
@@ -2359,8 +2447,7 @@ class ZeroWaveApp:
             rs = self.f_xxs.render(rtxt.strip(), True, CYAN)
             self.screen.blit(rs, (W - 10 - rs.get_width(), y + 6))
             y += 21
-        hint = "ENT:Tune  A:Scan Band  Q:Switch Mode" if am == "ANALOG" else "ENT:Select Preset  Q:Switch Mode"
-        self.draw_footer(hint)
+        self.draw_footer("ENT:Select Preset  Q:Switch Mode")
 
     # --- TAB 3: SAVED LIST ----------------------------------------------------
     def draw_list(self) -> None:

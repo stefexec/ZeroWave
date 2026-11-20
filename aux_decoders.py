@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Auxiliary 2m/70cm RTL-SDR decoder runners for ZeroWave:
-  - AnalogRunner  : NFM / AM (Airband) / WFM via rtl_fm -> pacat (+ optional WAV recording)
-  - PagerRunner   : POCSAG 512/1200/2400 & FLEX via rtl_fm -> multimon-ng
-  - AprsRunner    : APRS AFSK1200 via rtl_fm -> multimon-ng
-  - Ism433Runner  : 433/868 MHz Sensors & TPMS via rtl_433 -F json
-  - SondeRunner   : 400-406 MHz Vaisala RS41 Weather Balloons via rtl_fm -> rs41mod
+Zombie-free 2m/70cm RTL-SDR decoder runners for ZeroWave.
+Spawns pipelines directly via subprocess.Popen (no bash -c subshells) so every
+rtl_fm / pacat / multimon-ng / rtl_433 / rs41mod process is cleanly terminated,
+waited on, and its USB handle is 100% released before reopening the RTL-SDR.
 """
 
 from __future__ import annotations
@@ -21,30 +19,21 @@ import time
 from typing import Callable
 
 
-def _kill_proc(proc: subprocess.Popen | None) -> None:
+def _terminate_and_reap(proc: subprocess.Popen | None, wait_s: float = 1.0) -> None:
     if proc is None:
         return
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
-    except Exception:
-        try:
+        if proc.poll() is None:
             proc.terminate()
-        except Exception:
-            pass
-    try:
-        proc.wait(timeout=1.0)
-    except Exception:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
             try:
+                proc.wait(timeout=wait_s)
+            except subprocess.TimeoutExpired:
                 proc.kill()
-            except Exception:
-                pass
-        try:
-            proc.wait(timeout=0.4)
-        except Exception:
-            pass
+                proc.wait(timeout=0.5)
+        else:
+            proc.wait(timeout=0.1)
+    except Exception:
+        pass
 
 
 def _base_env() -> dict[str, str]:
@@ -55,13 +44,30 @@ def _base_env() -> dict[str, str]:
     return env
 
 
+def _rtl_fm_base(freq_hz: int, mode: str, s_rate: str, out_rate: int | None, gain_db: int, ppm: int, squelch: int = 0, deemp: bool = False) -> list[str]:
+    cmd = ["rtl_fm", "-f", str(int(freq_hz)), "-M", mode, "-s", str(s_rate)]
+    if out_rate is not None:
+        cmd.extend(["-r", str(int(out_rate))])
+    if int(gain_db) > 0:
+        cmd.extend(["-g", str(int(gain_db))])
+    if int(ppm) != 0:
+        cmd.extend(["-p", str(int(ppm))])
+    if int(squelch) > 0:
+        cmd.extend(["-l", str(int(squelch))])
+    if deemp:
+        cmd.extend(["-E", "deemp"])
+    cmd.extend(["-E", "dc"])
+    return cmd
+
+
 # ==============================================================================
-# 1) ANALOG RUNNER (NFM / AM / WFM via rtl_fm -> pacat)
+# 1) ANALOG RUNNER (NFM / AM / WFM via direct rtl_fm -> pacat pipeline)
 # ==============================================================================
 class AnalogRunner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._proc: subprocess.Popen | None = None
+        self._p_rtl: subprocess.Popen | None = None
+        self._p_out: subprocess.Popen | None = None
         self.running = False
         self.freq_hz = 0
         self.mod = "NFM"
@@ -78,51 +84,69 @@ class AnalogRunner:
         self.stop()
         mod_u = mod.upper()
         if mod_u == "AM":
-            s_rate, out_rate, m_flag, extra = "12k", 24000, "am", ""
+            rtl_cmd = _rtl_fm_base(freq_hz, "am", "12k", 24000, gain_db, ppm, squelch=squelch, deemp=False)
+            out_rate = 24000
         elif mod_u == "WFM":
-            s_rate, out_rate, m_flag, extra = "170k", 32000, "wbfm", "-E deemp"
+            rtl_cmd = _rtl_fm_base(freq_hz, "wbfm", "170k", 32000, gain_db, ppm, squelch=0, deemp=True)
+            out_rate = 32000
         else:
             mod_u = "NFM"
-            s_rate, out_rate, m_flag, extra = "12k", 24000, "fm", "-E deemp"
+            rtl_cmd = _rtl_fm_base(freq_hz, "fm", "12k", 24000, gain_db, ppm, squelch=squelch, deemp=True)
+            out_rate = 24000
 
-        g_arg = f"-g {int(gain_db)}" if int(gain_db) > 0 else ""
-        p_arg = f"-p {int(ppm)}" if int(ppm) != 0 else ""
-        sq_arg = f"-l {int(squelch)}" if (mod_u != "WFM" and int(squelch) > 0) else ""
-
-        rtl_cmd = f"rtl_fm -f {int(freq_hz)} -M {m_flag} -s {s_rate} -r {out_rate} {g_arg} {p_arg} {sq_arg} {extra} -E dc"
-        pacat_cmd = f"pacat --format=s16le --rate={out_rate} --channels=1 --latency-msec=100"
-        shell_cmd = f"{rtl_cmd} 2>/dev/null | {pacat_cmd} 2>/dev/null"
-
+        pacat_cmd = [
+            "pacat",
+            "--format=s16le",
+            f"--rate={out_rate}",
+            "--channels=1",
+            "--latency-msec=100",
+        ]
+        env = _base_env()
+        p_rtl = None
+        p_out = None
         try:
-            proc = subprocess.Popen(
-                ["bash", "-c", shell_cmd],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+            p_rtl = subprocess.Popen(
+                rtl_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
-                env=_base_env(),
-                start_new_session=True,
+                env=env,
             )
+            p_out = subprocess.Popen(
+                pacat_cmd,
+                stdin=p_rtl.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            if p_rtl.stdout:
+                p_rtl.stdout.close()
             with self._lock:
-                self._proc = proc
+                self._p_rtl = p_rtl
+                self._p_out = p_out
                 self.running = True
                 self.freq_hz = int(freq_hz)
                 self.mod = mod_u
                 self.error = ""
         except Exception as e:
+            _terminate_and_reap(p_rtl)
+            _terminate_and_reap(p_out)
             with self._lock:
                 self.running = False
                 self.error = str(e)[:48]
 
     def stop(self) -> None:
         with self._lock:
-            proc = self._proc
-            self._proc = None
+            p_rtl, p_out = self._p_rtl, self._p_out
+            self._p_rtl = None
+            self._p_out = None
             self.running = False
-        _kill_proc(proc)
+        _terminate_and_reap(p_rtl, wait_s=1.0)
+        _terminate_and_reap(p_out, wait_s=0.6)
 
 
 # ==============================================================================
-# 2) PAGER RUNNER (POCSAG 512/1200/2400 + FLEX via multimon-ng)
+# 2) PAGER RUNNER (POCSAG 512/1200/2400 + FLEX via direct rtl_fm -> multimon-ng)
 # ==============================================================================
 POCSAG_RE = re.compile(
     r"^(POCSAG\d+|FLEX)[:|]\s*(?:Address:\s*(\d+)\s+Function:\s*(\d+)\s+(?:Alpha|Numeric|Skyper):\s*(.*)|.*\|\s*(\d+)\s*\|\s*(?:ALN|NUM)\s*\|\s*(.*))$",
@@ -133,7 +157,8 @@ POCSAG_RE = re.compile(
 class PagerRunner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._proc: subprocess.Popen | None = None
+        self._p_rtl: subprocess.Popen | None = None
+        self._p_mm: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self.running = False
         self.freq_hz = 439_987_500
@@ -143,40 +168,48 @@ class PagerRunner:
 
     def start(self, freq_hz: int, gain_db: int = 0, ppm: int = 0) -> None:
         self.stop()
-        # Use decent manual gain if AUTO is set, since rtl_fm AGC can miss brief POCSAG bursts
         g_val = int(gain_db) if int(gain_db) > 0 else 40
-        p_arg = f"-p {int(ppm)}" if int(ppm) != 0 else ""
-        shell_cmd = (
-            f"rtl_fm -f {int(freq_hz)} -M fm -s 22050 -g {g_val} {p_arg} -E dc 2>/dev/null | "
-            f"stdbuf -oL multimon-ng -t raw -a POCSAG512 -a POCSAG1200 -a POCSAG2400 -a FLEX -f auto -e -u - 2>/dev/null"
-        )
+        rtl_cmd = _rtl_fm_base(freq_hz, "fm", "22050", None, g_val, ppm, squelch=0, deemp=False)
+        mm_cmd = [
+            "stdbuf", "-oL", "multimon-ng", "-t", "raw",
+            "-a", "POCSAG512", "-a", "POCSAG1200", "-a", "POCSAG2400", "-a", "FLEX",
+            "-f", "auto", "-e", "-u", "-",
+        ]
+        env = _base_env()
+        p_rtl = None
+        p_mm = None
         try:
-            proc = subprocess.Popen(
-                ["bash", "-c", shell_cmd],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                env=_base_env(),
-                start_new_session=True,
+            p_rtl = subprocess.Popen(
+                rtl_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env
             )
+            p_mm = subprocess.Popen(
+                mm_cmd, stdin=p_rtl.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env
+            )
+            if p_rtl.stdout:
+                p_rtl.stdout.close()
             with self._lock:
-                self._proc = proc
+                self._p_rtl = p_rtl
+                self._p_mm = p_mm
                 self.running = True
                 self.freq_hz = int(freq_hz)
                 self.error = ""
-            self._thread = threading.Thread(target=self._reader, args=(proc,), daemon=True)
+            self._thread = threading.Thread(target=self._reader, args=(p_mm,), daemon=True)
             self._thread.start()
         except Exception as e:
+            _terminate_and_reap(p_rtl)
+            _terminate_and_reap(p_mm)
             with self._lock:
                 self.running = False
                 self.error = str(e)[:48]
 
     def stop(self) -> None:
         with self._lock:
-            proc = self._proc
-            self._proc = None
+            p_rtl, p_mm = self._p_rtl, self._p_mm
+            self._p_rtl = None
+            self._p_mm = None
             self.running = False
-        _kill_proc(proc)
+        _terminate_and_reap(p_rtl, wait_s=1.0)
+        _terminate_and_reap(p_mm, wait_s=0.6)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=0.5)
         self._thread = None
@@ -200,7 +233,6 @@ class PagerRunner:
                 proto = m.group(1).upper()
                 ric = m.group(2) or m.group(5) or "?"
                 text = (m.group(4) or m.group(6) or "").strip()
-                # Strip control placeholders like <NUL><EOT>
                 text = re.sub(r"<[A-Z0-9]{2,4}>", "", text).strip()
                 if not text or len(text) < 2:
                     continue
@@ -223,12 +255,12 @@ class PagerRunner:
             pass
         finally:
             with self._lock:
-                if self._proc is proc:
+                if self._p_mm is proc:
                     self.running = False
 
 
 # ==============================================================================
-# 3) APRS RUNNER (AFSK1200 via rtl_fm -> multimon-ng)
+# 3) APRS RUNNER (AFSK1200 via direct rtl_fm -> multimon-ng)
 # ==============================================================================
 APRS_RE = re.compile(r"^APRS:\s*([A-Z0-9-]+)>([^:]+):(.*)$", re.IGNORECASE)
 APRS_POS_RE = re.compile(r"(\d{4}\.\d{2}[NS]).(\d{5}\.\d{2}[EW])")
@@ -237,7 +269,8 @@ APRS_POS_RE = re.compile(r"(\d{4}\.\d{2}[NS]).(\d{5}\.\d{2}[EW])")
 class AprsRunner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._proc: subprocess.Popen | None = None
+        self._p_rtl: subprocess.Popen | None = None
+        self._p_mm: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self.running = False
         self.freq_hz = 144_800_000
@@ -248,38 +281,43 @@ class AprsRunner:
     def start(self, freq_hz: int, gain_db: int = 0, ppm: int = 0) -> None:
         self.stop()
         g_val = int(gain_db) if int(gain_db) > 0 else 40
-        p_arg = f"-p {int(ppm)}" if int(ppm) != 0 else ""
-        shell_cmd = (
-            f"rtl_fm -f {int(freq_hz)} -M fm -s 22050 -g {g_val} {p_arg} -E dc 2>/dev/null | "
-            f"stdbuf -oL multimon-ng -t raw -a AFSK1200 -A - 2>/dev/null"
-        )
+        rtl_cmd = _rtl_fm_base(freq_hz, "fm", "22050", None, g_val, ppm, squelch=0, deemp=False)
+        mm_cmd = ["stdbuf", "-oL", "multimon-ng", "-t", "raw", "-a", "AFSK1200", "-A", "-"]
+        env = _base_env()
+        p_rtl = None
+        p_mm = None
         try:
-            proc = subprocess.Popen(
-                ["bash", "-c", shell_cmd],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                env=_base_env(),
-                start_new_session=True,
+            p_rtl = subprocess.Popen(
+                rtl_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env
             )
+            p_mm = subprocess.Popen(
+                mm_cmd, stdin=p_rtl.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env
+            )
+            if p_rtl.stdout:
+                p_rtl.stdout.close()
             with self._lock:
-                self._proc = proc
+                self._p_rtl = p_rtl
+                self._p_mm = p_mm
                 self.running = True
                 self.freq_hz = int(freq_hz)
                 self.error = ""
-            self._thread = threading.Thread(target=self._reader, args=(proc,), daemon=True)
+            self._thread = threading.Thread(target=self._reader, args=(p_mm,), daemon=True)
             self._thread.start()
         except Exception as e:
+            _terminate_and_reap(p_rtl)
+            _terminate_and_reap(p_mm)
             with self._lock:
                 self.running = False
                 self.error = str(e)[:48]
 
     def stop(self) -> None:
         with self._lock:
-            proc = self._proc
-            self._proc = None
+            p_rtl, p_mm = self._p_rtl, self._p_mm
+            self._p_rtl = None
+            self._p_mm = None
             self.running = False
-        _kill_proc(proc)
+        _terminate_and_reap(p_rtl, wait_s=1.0)
+        _terminate_and_reap(p_mm, wait_s=0.6)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=0.5)
         self._thread = None
@@ -323,7 +361,7 @@ class AprsRunner:
             pass
         finally:
             with self._lock:
-                if self._proc is proc:
+                if self._p_mm is proc:
                     self.running = False
 
 
@@ -337,7 +375,7 @@ class Ism433Runner:
         self._thread: threading.Thread | None = None
         self.running = False
         self.freq_hz = 433_920_000
-        self.sensors: dict[str, dict] = {}   # key = "model|id" -> latest sensor dict
+        self.sensors: dict[str, dict] = {}
         self.total_rx = 0
         self.on_sensor: Callable[[dict], None] | None = None
         self.error = ""
@@ -357,7 +395,6 @@ class Ism433Runner:
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
                 env=_base_env(),
-                start_new_session=True,
             )
             with self._lock:
                 self._proc = proc
@@ -376,7 +413,7 @@ class Ism433Runner:
             proc = self._proc
             self._proc = None
             self.running = False
-        _kill_proc(proc)
+        _terminate_and_reap(proc, wait_s=1.0)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=0.5)
         self._thread = None
@@ -420,7 +457,6 @@ class Ism433Runner:
                 if "battery_ok" in d:
                     parts.append("BAT:OK" if d["battery_ok"] else "BAT:LOW")
                 if not parts:
-                    # Fallback for switches/remotes
                     for k in ("cmd", "state", "code", "button"):
                         if k in d:
                             parts.append(f"{k}:{d[k]}")
@@ -453,7 +489,7 @@ class Ism433Runner:
 
 
 # ==============================================================================
-# 5) RADIOSONDE RUNNER (Vaisala RS41 400-406 MHz via rtl_fm -> rs41mod)
+# 5) RADIOSONDE RUNNER (Vaisala RS41 via direct rtl_fm -> sox -> rs41mod)
 # ==============================================================================
 RS41_LINE_RE = re.compile(
     r"\[(\d+)\]\s+\(([A-Z0-9_-]+)\).*?lat:\s*([-0-9.]+)\s+lon:\s*([-0-9.]+)\s+alt:\s*([-0-9.]+)",
@@ -466,7 +502,7 @@ RS41_TEMP_RE = re.compile(r"T=([-0-9.]+)C", re.IGNORECASE)
 class SondeRunner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._proc: subprocess.Popen | None = None
+        self._procs: list[subprocess.Popen] = []
         self._thread: threading.Thread | None = None
         self.running = False
         self.freq_hz = 403_000_000
@@ -481,41 +517,42 @@ class SondeRunner:
             with self._lock:
                 self.error = "rs41mod not installed"
             return
-        g_arg = f"-g {int(gain_db)}" if int(gain_db) > 0 else ""
-        p_arg = f"-p {int(ppm)}" if int(ppm) != 0 else ""
-        shell_cmd = (
-            f"rtl_fm -f {int(freq_hz)} -M fm -s 48000 {g_arg} {p_arg} -E dc 2>/dev/null | "
-            f"sox -t raw -r 48000 -e signed -b 16 -c 1 - -t wav - 2>/dev/null | "
-            f"stdbuf -oL /usr/local/bin/rs41mod --ptu - 2>/dev/null"
-        )
+        g_val = int(gain_db) if int(gain_db) > 0 else 40
+        rtl_cmd = _rtl_fm_base(freq_hz, "fm", "48000", None, g_val, ppm, squelch=0, deemp=False)
+        sox_cmd = ["sox", "-t", "raw", "-r", "48000", "-e", "signed", "-b", "16", "-c", "1", "-", "-t", "wav", "-"]
+        rs_cmd = ["stdbuf", "-oL", "/usr/local/bin/rs41mod", "--ptu", "-"]
+        env = _base_env()
+        p1 = p2 = p3 = None
         try:
-            proc = subprocess.Popen(
-                ["bash", "-c", shell_cmd],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                env=_base_env(),
-                start_new_session=True,
-            )
+            p1 = subprocess.Popen(rtl_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, env=env)
+            p2 = subprocess.Popen(sox_cmd, stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+            p3 = subprocess.Popen(rs_cmd, stdin=p2.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+            if p1.stdout:
+                p1.stdout.close()
+            if p2.stdout:
+                p2.stdout.close()
             with self._lock:
-                self._proc = proc
+                self._procs = [p1, p2, p3]
                 self.running = True
                 self.freq_hz = int(freq_hz)
                 self.latest = None
                 self.error = ""
-            self._thread = threading.Thread(target=self._reader, args=(proc,), daemon=True)
+            self._thread = threading.Thread(target=self._reader, args=(p3,), daemon=True)
             self._thread.start()
         except Exception as e:
+            for p in (p1, p2, p3):
+                _terminate_and_reap(p)
             with self._lock:
                 self.running = False
                 self.error = str(e)[:48]
 
     def stop(self) -> None:
         with self._lock:
-            proc = self._proc
-            self._proc = None
+            procs = list(self._procs)
+            self._procs = []
             self.running = False
-        _kill_proc(proc)
+        for p in procs:
+            _terminate_and_reap(p, wait_s=0.8)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=0.5)
         self._thread = None
@@ -563,5 +600,5 @@ class SondeRunner:
             pass
         finally:
             with self._lock:
-                if self._proc is proc:
+                if proc in self._procs:
                     self.running = False
