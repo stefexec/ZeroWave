@@ -682,6 +682,11 @@ class ZeroWaveEngine:
             cur = self.config.get("analog_mod", "NFM")
             nxt = ANALOG_MODS[(ANALOG_MODS.index(cur) + 1) % len(ANALOG_MODS)] if cur in ANALOG_MODS else "NFM"
             self.config["analog_mod"] = nxt
+            # Hold in TUNER on current freq so AUTO band-sweep doesn't snap analog_mod back to the band's default
+            if self.config.get("analog_scan", False):
+                self.config["analog_scan"] = False
+                if self.active_freq_hz > 0:
+                    self.config["analog_freq_hz"] = int(self.active_freq_hz)
         self.save_config()
         self._interrupt_evt.set()
         return nxt
@@ -2038,7 +2043,7 @@ class ZeroWaveApp:
 
         # Active mode color badge on far left (press Q!)
         m_col = dict((m[0], m[3]) for m in APP_MODES).get(am, MINT)
-        short_m = {"VOICE": "DV", "ANALOG": "FM", "PAGER": "PG", "APRS": "AP", "ISM433": "433", "SONDE": "RS"}.get(am, am[:2])
+        short_m = {"VOICE": "DV", "ANALOG": "AN", "PAGER": "PG", "APRS": "AP", "ISM433": "433", "SONDE": "RS"}.get(am, am[:2])
         mw = self._pill(3, 3, f"Q:{short_m}", BG, m_col)
 
         # Tabs 1..5
