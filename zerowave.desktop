@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ZeroWave
+Comment=2m/70cm All-Mode RTL-SDR Scanner & Decoder
+Exec=/usr/share/APPLaunch/bin/zerowave
+Icon=share/images/zerowave.png
+Terminal=false
+Categories=Utility;
+StartupNotify=false
