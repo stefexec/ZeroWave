@@ -54,7 +54,8 @@ Portal: <https://dev.cardputer.cc/#/upload>
 
 ## Submission Result
 
-- Status: `submitted (PR open — awaiting device demo video for first-time app review)`
+- Status: `submitted (CI passed, device demo video posted — awaiting maintainer merge)`
 - Submitted at: `2026-11-20`
+- Demo video URL: `https://github.com/stefexec/ZeroWave/releases/download/v1.0.0/zerowave-1.0.0-device-demo.mp4`
 - Buffer release URL: `https://github.com/stefexec/packages/releases/download/czdev-buffer/zerowave_1.0.0_arm64.deb`
 - Tracking / Pull-Request URL: `https://github.com/CardputerZero/packages/pull/582`
