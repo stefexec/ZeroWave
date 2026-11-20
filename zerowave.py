@@ -294,7 +294,7 @@ class AudioControl:
 
     def start_recording(self, tag: str) -> str:
         """
-        Seamless live WAV recording directly from PipeWire @DEFAULT_MONITOR@.
+        Seamless live WAV recording directly from PipeWire output monitor via pw-record.
         Never restarts dsd-fme or rtl_fm — zero audio drop, zero return to scan screen!
         """
         self.stop_recording()
@@ -303,17 +303,16 @@ class AudioControl:
         ts = time.strftime("%Y%m%d_%H%M%S")
         fname = f"{safe_tag}_{ts}.wav"
         fpath = os.path.join(REC_DIR, fname)
+        sink = self._run_pactl(["get-default-sink"]).strip()
+        cmd = ["pw-record", "--rate=16000", "--channels=1", "--format=s16"]
+        if sink:
+            cmd.extend(["--target", f"{sink}.monitor"])
+        else:
+            cmd.extend(["-P", "stream.capture.sink=true"])
+        cmd.append(fpath)
         try:
             self._rec_proc = subprocess.Popen(
-                [
-                    "parec",
-                    "-d", "@DEFAULT_MONITOR@",
-                    "--file-format=wav",
-                    "--rate=16000",
-                    "--channels=1",
-                    "--format=s16le",
-                    fpath,
-                ],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
