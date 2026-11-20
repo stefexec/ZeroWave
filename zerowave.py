@@ -400,6 +400,7 @@ class ZeroWaveEngine:
         self.dsd.on_call_event = self._on_event
         self.pager.on_message = self._on_event
         self.aprs.on_packet = self._on_event
+        self.ism.on_sensor = self._on_event
         self.sonde.on_sonde = self._on_event
 
         self.config = {
@@ -430,7 +431,10 @@ class ZeroWaveEngine:
         }
         self.channels: list[dict] = [dict(c) for c in DEFAULT_CHANNELS]
         self.blacklist: set[int] = set()
-        self.event_log: collections.deque[dict] = collections.deque(maxlen=250)
+        self.event_logs: dict[str, collections.deque[dict]] = {
+            m[0]: collections.deque(maxlen=200) for m in APP_MODES
+        }
+        self._ism_last_log: dict[str, float] = {}
 
         self._load_all()
 
@@ -491,16 +495,34 @@ class ZeroWaveEngine:
                     self.blacklist = set(int(x) for x in bl)
         except Exception:
             pass
-        try:
-            if os.path.exists(LOG_FILE):
-                with open(LOG_FILE, "r", encoding="utf-8") as f:
-                    logs = json.load(f)
-                if isinstance(logs, list):
-                    for item in logs[-250:]:
-                        if isinstance(item, dict):
-                            self.event_log.append(item)
-        except Exception:
-            pass
+        # Load per-mode logs (migrating legacy unified event_log.json if needed)
+        loaded_any = False
+        for mode_id in self.event_logs:
+            p = os.path.join(CONFIG_DIR, f"log_{mode_id.lower()}.json")
+            try:
+                if os.path.exists(p):
+                    with open(p, "r", encoding="utf-8") as f:
+                        logs = json.load(f)
+                    if isinstance(logs, list):
+                        for item in logs[-200:]:
+                            if isinstance(item, dict):
+                                self.event_logs[mode_id].append(item)
+                        loaded_any = True
+            except Exception:
+                pass
+        if not loaded_any:
+            try:
+                if os.path.exists(LOG_FILE):
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        logs = json.load(f)
+                    if isinstance(logs, list):
+                        for item in logs[-250:]:
+                            if isinstance(item, dict):
+                                k = str(item.get("kind", "VOICE")).upper()
+                                if k in self.event_logs:
+                                    self.event_logs[k].append(item)
+            except Exception:
+                pass
 
     def save_config(self) -> None:
         try:
@@ -526,13 +548,28 @@ class ZeroWaveEngine:
         except Exception:
             pass
 
-    def save_log(self) -> None:
+    def save_log(self, mode_id: str | None = None) -> None:
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                json.dump(list(self.event_log), f)
+            targets = [mode_id] if (mode_id and mode_id in self.event_logs) else list(self.event_logs.keys())
+            for mid in targets:
+                p = os.path.join(CONFIG_DIR, f"log_{mid.lower()}.json")
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(list(self.event_logs[mid]), f)
         except Exception:
             pass
+
+    def get_mode_log(self, mode_id: str | None = None) -> list[dict]:
+        with self.lock:
+            mid = mode_id or self.config["app_mode"]
+            return list(self.event_logs.get(mid, ()))
+
+    def clear_mode_log(self, mode_id: str | None = None) -> None:
+        with self.lock:
+            mid = mode_id or self.config["app_mode"]
+            if mid in self.event_logs:
+                self.event_logs[mid].clear()
+        self.save_log(mid)
 
     def _stop_all_backends(self) -> None:
         was_active = any((
@@ -726,9 +763,19 @@ class ZeroWaveEngine:
         return False
 
     def _on_event(self, ev: dict) -> None:
+        kind = str(ev.get("kind", "VOICE")).upper()
+        if kind not in self.event_logs:
+            kind = "VOICE"
         with self.lock:
+            # Rate-limit ISM433 sensor log spam (max 1 log entry per 30s per sensor)
+            if kind == "ISM433":
+                skey = f"{ev.get('model', '')}|{ev.get('id', '')}"
+                now = time.time()
+                if now - self._ism_last_log.get(skey, 0.0) < 30.0:
+                    return
+                self._ism_last_log[skey] = now
             # Enrich VOICE event with RadioID & Talkgroup DB
-            if ev.get("kind") == "VOICE":
+            if kind == "VOICE":
                 src = ev.get("src", "")
                 if src.isdigit():
                     info = self.db.lookup_id(src)
@@ -749,8 +796,8 @@ class ZeroWaveEngine:
                         tg=tg,
                         source="AUTO",
                     )
-            self.event_log.appendleft(ev)
-        self.save_log()
+            self.event_logs[kind].appendleft(ev)
+        self.save_log(kind)
 
     # --- Background Worker Loop -----------------------------------------------
     def _worker_loop(self) -> None:
@@ -1102,6 +1149,14 @@ class ZeroWaveEngine:
                             self.active_label = bname
                             self.active_snr_db = pk.snr_db
                             self.status_text = f"{bmod} LOCK +{pk.snr_db:.0f}dB (B:Next SPC:Hold)"
+                        self._on_event({
+                            "kind": "ANALOG",
+                            "ts": time.time(),
+                            "freq_hz": pk.freq_hz,
+                            "mod": bmod,
+                            "snr": round(pk.snr_db, 1),
+                            "band": bname,
+                        })
                         self.analog.start(
                             freq_hz=pk.freq_hz, mod=bmod,
                             gain_db=int(cfg["gain_db"]), ppm=int(cfg["ppm"]),
@@ -1775,12 +1830,12 @@ class ZeroWaveApp:
                     pass
             return
 
-        logs = list(self.engine.event_log)
+        am = self.engine.config["app_mode"]
+        logs = self.engine.get_mode_log(am)
         if code == KEY_C:
-            self.engine.event_log.clear()
-            self.engine.save_log()
+            self.engine.clear_mode_log(am)
             self.log_sel = 0
-            self.show_toast("Event log cleared")
+            self.show_toast(f"{am} log cleared")
             return
         if not logs:
             return
@@ -1791,10 +1846,24 @@ class ZeroWaveApp:
             self.log_sel = min(len(logs) - 1, self.log_sel + 1)
         elif code == KEY_ENTER:
             ev = logs[self.log_sel]
-            if ev.get("kind") in ("PAGER", "APRS"):
-                self.detail_title = f"{ev.get('kind')} {ev.get('ric', ev.get('src', ''))}"
+            kind = ev.get("kind", am)
+            if kind in ("PAGER", "APRS"):
+                self.detail_title = f"{kind} {ev.get('ric', ev.get('src', ''))}"
                 self.detail_body = str(ev.get("text", ""))
                 self.modal = "MSG_DETAIL"
+            elif kind == "ISM433":
+                self.detail_title = f"{ev.get('model', 'Sensor')} #{ev.get('id', '')}"
+                self.detail_body = f"{fmt_mhz(int(ev.get('freq_hz', 433920000)))} MHz\n{ev.get('summary', '')}"
+                self.modal = "MSG_DETAIL"
+            elif kind == "ANALOG":
+                self.engine.config["analog_mod"] = ev.get("mod", "NFM")
+                self.engine.set_app_mode("ANALOG")
+                self.engine.tune_freq(int(ev.get("freq_hz", 100_000_000)), ev.get("band", ""))
+                self.tab_idx = 0
+            elif kind == "SONDE":
+                self.engine.set_app_mode("SONDE")
+                self.engine.tune_freq(int(ev.get("freq_hz", 403_000_000)), ev.get("sonde_id", "RS41"))
+                self.tab_idx = 0
             else:
                 self.engine.set_app_mode("VOICE")
                 self.engine.tune_freq(int(ev.get("freq_hz", 438_425_000)), ev.get("callsign", ""))
@@ -1940,6 +2009,7 @@ class ZeroWaveApp:
         self.engine.set_app_mode(mode_id)
         self.feed_scroll = 0
         self.band_sel = 0
+        self.log_sel = 0
         self.tab_idx = 0
         self.modal = None
         self.show_toast(f"Mode: {title}")
@@ -2480,15 +2550,18 @@ class ZeroWaveApp:
                 y += 21
         self.draw_footer("ENT:Tune  S:Scan List  N:Add  D:Del  B:Blacklist")
 
-    # --- TAB 4: LOG & RECORDINGS PLAYBACK -------------------------------------
+    # --- TAB 4: PER-MODE LOG & RECORDINGS PLAYBACK ----------------------------
     def draw_log(self) -> None:
-        # Sub-bar toggle: EVENTS | RECORDINGS
-        pygame.draw.rect(self.screen, ELEVATED, (4, 22, W - 8, 16), border_radius=3)
+        am = self.engine.config["app_mode"]
+        mode_col = dict((m[0], m[3]) for m in APP_MODES).get(am, MINT)
+        logs = self.engine.get_mode_log(am)
         recs = self._list_recordings()
-        e_col = MINT if self.log_view == "EVENTS" else SUBTEXT
+
+        pygame.draw.rect(self.screen, ELEVATED, (4, 22, W - 8, 16), border_radius=3)
+        e_col = mode_col if self.log_view == "EVENTS" else SUBTEXT
         r_col = PINK if self.log_view == "RECS" else SUBTEXT
-        self.screen.blit(self.f_xs_b.render(f"EVENTS ({len(self.engine.event_log)})", True, e_col), (12, 24))
-        self.screen.blit(self.f_xs_b.render(f"RECORDINGS ({len(recs)})", True, r_col), (120, 24))
+        self.screen.blit(self.f_xs_b.render(f"{am} LOG ({len(logs)})", True, e_col), (10, 24))
+        self.screen.blit(self.f_xs_b.render(f"RECORDINGS ({len(recs)})", True, r_col), (132, 24))
         if self.audio.is_playing():
             self._pill(W - 60, 23, "PLAYING", GREEN, GREEN_DARK)
 
@@ -2515,12 +2588,11 @@ class ZeroWaveApp:
                     ks = self.f_xxs.render(f"{kb}KB", True, PINK)
                     self.screen.blit(ks, (W - 10 - ks.get_width(), y + 6))
                     y += 22
-            self.draw_footer("L/←→:Events  ENT:Play WAV  SPC:Stop  D:Delete")
+            self.draw_footer(f"L/←→:{am} Log  ENT:Play WAV  SPC:Stop  D:Del")
             return
 
-        logs = list(self.engine.event_log)
         if not logs:
-            msg = self.f_sm.render("No decoded events yet.", True, SUBTEXT)
+            msg = self.f_sm.render(f"No {am} events logged yet.", True, SUBTEXT)
             self.screen.blit(msg, (W // 2 - msg.get_width() // 2, 82))
         else:
             self.log_sel = max(0, min(len(logs) - 1, self.log_sel))
@@ -2532,16 +2604,22 @@ class ZeroWaveApp:
                 sel = i == self.log_sel
                 pygame.draw.rect(self.screen, ELEVATED if sel else SURFACE, (4, y, W - 8, 21), border_radius=3)
                 if sel:
-                    pygame.draw.rect(self.screen, MINT, (4, y, W - 8, 21), 1, border_radius=3)
+                    pygame.draw.rect(self.screen, mode_col, (4, y, W - 8, 21), 1, border_radius=3)
                 ts = datetime.datetime.fromtimestamp(ev.get("ts", 0)).strftime("%H:%M:%S")
                 self.screen.blit(self.f_xxs.render(ts, True, MUTED), (8, y + 6))
-                kind = ev.get("kind", "VOICE")
+                kind = ev.get("kind", am)
                 if kind == "PAGER":
-                    txt = f"PG {ev.get('ric', '')}: {ev.get('text', '')}"
+                    txt = f"RIC {ev.get('ric', '')}: {ev.get('text', '')}"
                     self.screen.blit(self.f_xxs.render(txt[:42], True, WARN), (54, y + 6))
                 elif kind == "APRS":
-                    txt = f"AP {ev.get('src', '')}: {ev.get('text', '')}"
+                    txt = f"{ev.get('src', '')}: {ev.get('text', '')}"
                     self.screen.blit(self.f_xxs.render(txt[:42], True, CYAN), (54, y + 6))
+                elif kind == "ISM433":
+                    txt = f"{ev.get('model', '')[:14]} {ev.get('summary', '')}"
+                    self.screen.blit(self.f_xxs.render(txt[:42], True, GREEN), (54, y + 6))
+                elif kind == "ANALOG":
+                    txt = f"{fmt_mhz(int(ev.get('freq_hz', 0)))} {ev.get('mod', '')} +{ev.get('snr', 0):.0f}dB"
+                    self.screen.blit(self.f_xxs.render(txt[:42], True, PINK), (54, y + 6))
                 elif kind == "SONDE":
                     txt = f"RS41 {ev.get('sonde_id', '')} {ev.get('alt_m', '')}m"
                     self.screen.blit(self.f_xxs.render(txt[:42], True, (180, 130, 255)), (54, y + 6))
@@ -2551,7 +2629,7 @@ class ZeroWaveApp:
                     txt = f"{fmt_mhz(int(ev.get('freq_hz', 0)))} TG:{tg} {who}"
                     self.screen.blit(self.f_xxs.render(txt[:42], True, GREEN if not ev.get("encrypted") else DANGER), (54, y + 6))
                 y += 22
-        self.draw_footer("L/←→:Recordings  ENT:Tune/Read  C:Clear Log")
+        self.draw_footer(f"L/←→:Recs  ENT:Tune/Read  C:Clear {am} Log")
 
     # --- TAB 5: CFG + CALLSIGN DB DOWNLOADER ----------------------------------
     def draw_cfg(self) -> None:
