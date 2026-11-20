@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ZeroDMR
+Comment=RTL-SDR DMR Auto-Scanner & Decoder
+Exec=/usr/share/APPLaunch/bin/zerodmr
+Icon=share/images/zerodmr.png
+Terminal=false
+Categories=Utility;
+StartupNotify=false

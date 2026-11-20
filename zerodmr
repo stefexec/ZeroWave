@@ -1,0 +1,7 @@
+#!/bin/sh
+cd "${HOME:-/tmp}" 2>/dev/null || cd /tmp
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+# ES8389 speaker amp cuts out at 0 dB DAC volume; -6 dB (179) keeps voice audio stable.
+amixer -c 1 cset name='DACL Playback Volume' 179 >/dev/null 2>&1 || true
+amixer -c 1 cset name='DACR Playback Volume' 179 >/dev/null 2>&1 || true
+exec /usr/bin/python3 /usr/share/APPLaunch/apps/zerodmr/zerodmr.py "$@"
