@@ -1875,7 +1875,7 @@ class ZeroWaveApp:
                 self.tab_idx = 0
 
     def _key_cfg(self, code: int) -> None:
-        n_items = 12
+        n_items = 13
         if code == KEY_UP:
             self.cfg_sel = (self.cfg_sel - 1) % n_items
             return
@@ -1912,7 +1912,7 @@ class ZeroWaveApp:
             idx = BW_OPTIONS.index(bw) if bw in BW_OPTIONS else 1
             cfg["bw_khz"] = BW_OPTIONS[(idx + delta) % len(BW_OPTIONS)]
         elif self.cfg_sel == 5:  # Analog Squelch
-            cfg["analog_squelch"] = max(0, min(200, int(cfg.get("analog_squelch", 28)) + delta * 5))
+            cfg["analog_squelch"] = max(0, min(200, int(cfg.get("analog_squelch", 0)) + delta * 5))
         elif self.cfg_sel == 6:  # PPM
             cfg["ppm"] = max(-80, min(80, int(cfg["ppm"]) + delta))
         elif self.cfg_sel == 7:  # Peak Threshold
@@ -1921,9 +1921,11 @@ class ZeroWaveApp:
             cfg["verify_sec"] = round(max(1.0, min(5.0, float(cfg["verify_sec"]) + delta * 0.2)), 1)
         elif self.cfg_sel == 9:  # Hang Time
             cfg["hang_sec"] = round(max(1.5, min(12.0, float(cfg["hang_sec"]) + delta * 0.5)), 1)
-        elif self.cfg_sel == 10:  # Auto-Save
+        elif self.cfg_sel == 10:  # Skip Cooldown Length
+            cfg["cooldown_sec"] = float(max(5, min(300, int(round(float(cfg.get("cooldown_sec", 22.0)))) + delta * 5)))
+        elif self.cfg_sel == 11:  # Auto-Save
             cfg["auto_save_found"] = not cfg.get("auto_save_found", True)
-        elif self.cfg_sel == 11:  # Clear Blacklist
+        elif self.cfg_sel == 12:  # Clear Blacklist
             if code in (KEY_ENTER, KEY_SPACE):
                 self.engine.blacklist.clear()
                 self.engine.cooldowns.clear()
@@ -2655,11 +2657,12 @@ class ZeroWaveApp:
             ("WAV Recording (R)", "REC ON" if self.audio.is_recording() else "OFF"),
             ("RTL Gain", gain_str),
             ("RTL Bandwidth", f"{int(cfg.get('bw_khz', 12))} kHz"),
-            ("Analog Squelch", str(int(cfg.get("analog_squelch", 28)))),
+            ("Analog Squelch", str(int(cfg.get("analog_squelch", 0)))),
             ("PPM Correction", f"{int(cfg['ppm']):+d} ppm"),
             ("Peak Threshold", f"+{float(cfg['threshold_db']):.0f} dB"),
             ("Verify Timeout", f"{float(cfg['verify_sec']):.1f} s"),
             ("Call Hang Time", f"{float(cfg['hang_sec']):.1f} s"),
+            ("Skip Cooldown", f"{int(round(float(cfg.get('cooldown_sec', 22.0))))} s"),
             ("Auto-Save DMR", "ON" if cfg.get("auto_save_found", True) else "OFF"),
             ("Clear Blacklist", f"{len(self.engine.blacklist)} blk / {len(self.engine.cooldowns)} skip"),
         ]
